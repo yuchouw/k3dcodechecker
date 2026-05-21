@@ -1,31 +1,7 @@
-# -*- coding: utf-8 -*-
-"""
-GB50017-2017 steel section code checker.
-
-All functions work in GB50017 working units:  mm, N, MPa (N/mm²).
-Force/moment conversion from Karamba native (kN, kN·m) is done inside
-check_steel_element().
-
-Usage:
-    from karamba_helper import extract_section_properties, extract_material
-    from code_checker import check_steel_element
-
-    sec = extract_section_properties(crosec)
-    mat = extract_material(crosec)
-
-    for pos in element_forces:   # per position along beam
-        result = check_steel_element(sec, mat, len_y, len_z, pos)
-        # result = {'σ_N': 0.12, 'σ_My': 0.45, ...}
-"""
-
 import math
 
-# ============================================================================
-#  GB50017 Annex D  —  buckling curve coefficients
-# ============================================================================
-
 def calc_alpha(curve_class, lambda_n):
-    """Return buckling curve coefficients [α₁, α₂, α₃] per GB50017 Table D.0.2.
+    """Return buckling curve coefficients [α₁, α₂, α₃] per GB50017 Table D.0.5.
 
     Args:
         curve_class: 'a', 'b', 'c', or 'd'
@@ -70,10 +46,6 @@ def calc_phi(lambda_n, alpha):
         phi = (t - math.sqrt(t * t - 4.0 * lambda_n * lambda_n)) / (2.0 * lambda_n * lambda_n)
         return phi
 
-
-# ============================================================================
-#  Section classification  —  GB50017-2017  §3.2, Table 3.2
-# ============================================================================
 
 def classify_section(sec_props, fy):
     """Classify a steel section per GB50017 Table 3.2 and Table D.0.1.
@@ -231,97 +203,6 @@ def classify_section(sec_props, fy):
     return curve_y, curve_z, gamma_y, gamma_z, overall_class
 
 
-# ============================================================================
-#  First moment of area & shear thickness  —  for shear stress τ = V·S/(I·t)
-# ============================================================================
-
-def compute_S_and_t(sec_props):
-    """Compute first moment of area (S) and shear-resisting thickness (t).
-
-    Karamba provides A, I, W but not S or t directly.  These are derived
-    from section geometry for I-sections, box sections, and CHS.
-
-    Args:
-        sec_props: dict from extract_section_properties
-
-    Returns:
-        (Sy, Sz, ty, tz)
-            Sy [mm³]  first moment of half-section about strong axis
-            Sz [mm³]  first moment of half-section about weak axis
-            ty [mm]   shear thickness for strong-axis shear (Vz)
-            tz [mm]   shear thickness for weak-axis shear (Vy)
-    """
-    sec_type = sec_props.get('section_type', '')
-
-    bf = max(sec_props.get('uf_width', 0), sec_props.get('lf_width', 0))
-    tf_top = sec_props.get('uf_thick', 0)
-    tf_bot = sec_props.get('lf_thick', 0)
-    tf = max(tf_top, tf_bot)
-    tw = sec_props.get('w_thick', 0)
-    h  = sec_props.get('height', 0)
-
-    if 'I' in sec_type or 'Beam' in sec_type:
-        # --- I-section ---
-        # Sy: first moment of area above NA about y-axis
-        #     = flange contribution + web-half contribution
-        h0 = h - tf_top - tf_bot
-        h_web_half = h0 / 2.0
-        # Flange above NA
-        Sy_flange = bf * tf_top * (h / 2.0 - tf_top / 2.0)
-        # Web above NA
-        Sy_web = tw * h_web_half * h_web_half / 2.0  if h_web_half > 0 else 0
-        Sy = Sy_flange + Sy_web
-
-        # Sz: first moment of half-flange about z-axis
-        #     = tf × (bf/2) × (bf/4)  (rectangle half about its edge centre)
-        Sz = tf * bf * bf / 8.0
-
-        # Shear thicknesses
-        ty = tw   # web resists Vz shear
-        tz = tf_top + tf_bot  # both flanges resist Vy shear
-
-    elif 'Box' in sec_type:
-        # --- Rectangular hollow section ---
-        # Sy = [b·h² - (b-2tw)(h-2tf)²] / 8
-        if bf > 0 and h > 0:
-            b_inner = bf - 2 * tw
-            h_inner = h - tf_top - tf_bot
-            if b_inner < 0: b_inner = 0
-            if h_inner < 0: h_inner = 0
-            Sy = (bf * h * h - b_inner * h_inner * h_inner) / 8.0
-        else:
-            Sy = 0
-        Sz = (h * bf * bf - h_inner * b_inner * b_inner) / 8.0 if bf > 0 else 0
-        ty = 2 * tw   # both webs resist Vz
-        tz = tf_top + tf_bot  # top + bottom resist Vy
-
-    elif 'Circle' in sec_type:
-        # --- Circular hollow section ---
-        # Sy ≈ 0.166 × D³ for thin-walled tube  (approximate)
-        D = h
-        t = tw if tw > 0 else tf
-        if D > 0 and t > 0:
-            r_outer = D / 2.0
-            r_inner = r_outer - t
-            Sy = (4.0 / 3.0) * (r_outer**3 - r_inner**3)  # exact for tube
-            Sz = Sy  # symmetric
-        else:
-            Sy, Sz = 0, 0
-        ty = 2 * t
-        tz = 2 * t
-
-    else:
-        # Unknown — approximate using section moduli as lower bound
-        Sy, Sz = 0, 0
-        ty, tz = tw if tw > 0 else 1.0, tf if tf > 0 else 1.0
-
-    return Sy, Sz, ty, tz
-
-
-# ============================================================================
-#  Slenderness calculation  —  flexural / flexural-torsional buckling
-# ============================================================================
-
 def calc_slenderness(sec_props, len_y, len_z):
     """Calculate slenderness ratios λ_y, λ_z for buckling checks.
 
@@ -375,10 +256,6 @@ def calc_slenderness(sec_props, len_y, len_z):
 
     return lambda_y, lambda_z
 
-
-# ============================================================================
-#  GB50017-2017 steel element check  —  main entry point
-# ============================================================================
 
 def check_steel_element(sec_props, mat_props, len_y, len_z, force,
                         gamma_re=0.85, slender_limit=150):

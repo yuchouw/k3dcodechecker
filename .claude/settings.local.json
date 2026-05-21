@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.karamba3d.com)",
+      "WebSearch"
+    ]
+  }
+}

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Karamba3D helper utilities for GB50017 steel design checks.
 
@@ -6,29 +5,24 @@ Extracts forces, element info, section properties, and materials from a
 Karamba3D model.  All output is in GB50017 working units (mm, N, MPa) except
 extract_element_forces() which returns native Karamba units (kN, kN·m).
 
-Usage pattern (cache sections once, reuse per element):
-    all_sec = [extract_section_properties(sec) for sec in model.crosecs]
-    all_mat = [extract_material(sec)     for sec in model.crosecs]
-    elem_info  = extract_element_info(model)
-    sub_lcs    = expand_load_combinations(model, ['ULS'])
-    forces_all = extract_element_forces(model, elem_ids, [n for n,_ in sub_lcs])
+Usage pattern:
+    all_sec     = [extract_section_properties(sec) for sec in model.crosecs]
+    all_mat     = extract_materials(model)            # unique list from model.materials
+    mat_map     = build_material_index_map(model)     # sec_index → mat_index
+    sec_map     = build_section_index_map(model)      # elem_id → sec_index
+    sub_lcs     = expand_load_combinations(model, ['ULS'])
+    lc_names    = [n for n,_ in sub_lcs]
+    forces_all  = extract_element_forces(model, elem_ids, lc_names)
 
-    for ei, elem in enumerate(elem_info):
-        si   = elem['sec_index']
-        sec  = all_sec[si]   # cached lookup
-        mat  = all_mat[si]
-        for lc_name, _ in sub_lcs:
+    for ei, el in enumerate(model.Elements()):
+        info = extract_element_info(el)               # per-element
+        si   = sec_map.get(info['id'], -1)
+        sec  = all_sec[si]
+        mat  = all_mat[mat_map[si]]
+        for lc_name in lc_names:
             f = forces_all[lc_name][ei]
             # … run code_checker functions …
 """
-
-# ============================================================================
-#  Unit conversion constants  —  Karamba internal → GB50017 working units
-# ============================================================================
-# Karamba stores everything in m-based SI:
-#   m, m², m⁴, m³, m⁶,  kN,  kN·m,  kN/m²
-# GB50017 works in mm-based units:
-#   mm, mm², mm⁴, mm³, mm⁶,  N,   N·mm,  MPa (N/mm²)
 
 M_TO_MM      = 1e3       # m  → mm
 M2_TO_MM2    = 1e6       # m² → mm²
@@ -39,18 +33,8 @@ KN_TO_N      = 1e3       # kN → N
 KNM_TO_NMM   = 1e6       # kN·m → N·mm
 KN_M2_TO_MPA = 1e-3      # kN/m² → MPa (N/mm²)
 
-# ============================================================================
-#  Imports (Karamba .NET interop)
-# ============================================================================
-import math
 import re
-
-import Karamba.Models
-import Karamba.Loads
-import Karamba.Results
-import Karamba.CrossSections
-from System.Collections.Generic import List
-from System import String
+from Karamba.Elements import BuilderElementStraightLine
 
 
 # ============================================================================
@@ -58,21 +42,6 @@ from System import String
 # ============================================================================
 
 def expand_load_combinations(model, comb_names):
-    """Expand Load-Case-Combinator group names into their sub-load-cases.
-
-    For each combination group name (e.g. 'ULS'), queries the model's
-    lcActivation and returns the flat list of sub-combinations with their
-    per-load-case factors.
-
-    Args:
-        model: Karamba model (clone before passing if needed).
-        comb_names: list of combination group name strings.
-
-    Returns:
-        list of (lc_name, factors_dict) where lc_name is a string like
-        'ULS/0' and factors_dict maps source load-case names to factors,
-        e.g. {'G': 1.35, 'Q': 1.5}.
-    """
     sub_lcs = []
     for cn in comb_names:
         success, lcc = model.lcActivation.TryGetLoadCaseCombination(cn)
@@ -141,31 +110,23 @@ def extract_element_forces(model, elem_ids, lc_names, n_positions=5):
 
 
 # ============================================================================
-#  Element info  (id, type, length, section index)
+#  Section index mapping  (elem_id → sec_index via CroSec.elemIds patterns)
 # ============================================================================
 
-def extract_element_info(model):
-    """Return identity, geometry, and section mapping for every element.
+def build_section_index_map(model):
+    """Build a lookup mapping element ID → section index.
 
-    Section index (sec_index) is determined by matching element IDs against
-    the elemIds patterns stored on each CroSec object.
+    Matches element IDs against the elemIds regex patterns stored on each
+    CroSec object.
+
+    Args:
+        model: Karamba model.
 
     Returns:
-        list of dicts::
-
-            {
-                'id':         str,       # element identifier
-                'type':       str,       # e.g. 'Beam3D', 'Truss3D'
-                'length':     float,     # [mm]  straight-line node-to-node
-                'sec_index':  int,       # 0-based index into model.crosecs
-                'node_start': int,       # start node index
-                'node_end':   int,       # end node index
-            }
+        dict[str, int] — elem_id → 0-based index into model.crosecs.
+        Unmatched elements are absent from the dict (use .get(id, -1)).
     """
-    nodes = model.Nodes()
-
-    # ---- element → section lookup via CroSec.elemIds (exact or regex) ----
-    crosec_elem_map = {}   # elem_id → sec_index
+    mapping = {}
     for si, sec in enumerate(model.crosecs):
         if not hasattr(sec, 'elemIds') or sec.elemIds is None:
             continue
@@ -173,40 +134,25 @@ def extract_element_info(model):
             compiled = re.compile(pattern)
             for el in model.Elements():
                 if compiled.match(el.id):
-                    crosec_elem_map[el.id] = si
+                    mapping[el.id] = si
+    return mapping
 
-    # ---- build info for each element ----
-    info_list = []
-    for el in model.Elements():
-        # length from node positions
-        try:
-            n0_idx = el.node_inds[0]
-            n1_idx = el.node_inds[1]
-            n0 = nodes[n0_idx]
-            n1 = nodes[n1_idx]
-            dx = n1.pos.X - n0.pos.X
-            dy = n1.pos.Y - n0.pos.Y
-            dz = n1.pos.Z - n0.pos.Z
-            length = math.sqrt(dx*dx + dy*dy + dz*dz) * M_TO_MM
-        except:
-            length = 0.0
 
-        info_list.append({
-            'id':         el.id,
-            'type':       type(el).__name__,
-            'length':     length,
-            'sec_index':  crosec_elem_map.get(el.id, -1),
-            'node_start': getattr(el, 'node_inds', [None, None])[0],
-            'node_end':   getattr(el, 'node_inds', [None, None])[1] if (
-                          getattr(el, 'node_inds', None) and len(el.node_inds) > 1
-                          ) else None,
-        })
-
-    return info_list
+def extract_element_info(el):
+    bklY = el.buckling_length(BuilderElementStraightLine.BucklingDir.bklY) * M_TO_MM
+    bklZ = el.buckling_length(BuilderElementStraightLine.BucklingDir.bklZ) * M_TO_MM
+    bklLT = el.buckling_length(BuilderElementStraightLine.BucklingDir.bklLT) * M_TO_MM
+    
+    return {
+        'id':       el.id,
+        'bklY':     bklY,
+        'bklZ':     bklZ,
+        'bklLT':    bklLT
+    }
 
 
 # ============================================================================
-#  Section properties  (single CroSec → dict, units = mm / mm² / mm⁴ / mm³)
+#  Section properties  (units = mm / mm² / mm⁴ / mm³)
 # ============================================================================
 
 def extract_section_properties(crosec):
@@ -240,18 +186,14 @@ def extract_section_properties(crosec):
     Material (reference object)
         material   — attached FemMaterial instance (or None)
     """
-    crosec.calculateProperties()
-
     props = {}
 
-    # ---- identity ----
     for attr in ('name', 'family', 'familyID', 'guid', 'country_',
                  'user_defined', 'IsValid', 'isPlausible', 'product',
                  'alpha_y', 'alpha_z', 'alpha_lt'):
         if hasattr(crosec, attr):
             props[attr] = getattr(crosec, attr)
 
-    # ---- geometry [mm] ----
     for attr in ('lf_width', 'uf_width', 'lf_thick', 'uf_thick',
                  'w_thick', 'fillet_r', 'fillet_r1'):
         if hasattr(crosec, attr):
@@ -259,7 +201,6 @@ def extract_section_properties(crosec):
             if isinstance(val, (int, float)):
                 props[attr] = val * M_TO_MM
 
-    # height stored as _height on some section types
     for attr in ('_height', 'height'):
         if hasattr(crosec, attr):
             val = getattr(crosec, attr)
@@ -267,84 +208,50 @@ def extract_section_properties(crosec):
                 props['height'] = val * M_TO_MM
                 break
 
-    # centroid / shear centre [mm]
     for attr in ('zs', 'zm', 'zg'):
         if hasattr(crosec, attr):
             props[attr] = getattr(crosec, attr) * M_TO_MM
 
-    # ---- area & shear areas [mm²] ----
     for attr in ('A', 'Ay', 'Az'):
         if hasattr(crosec, attr):
             props[attr] = getattr(crosec, attr) * M2_TO_MM2
 
-    # ---- moments of inertia [mm⁴] ----
     for attr in ('Iyy', 'Izz', 'Ipp'):
         if hasattr(crosec, attr):
             props[attr] = getattr(crosec, attr) * M4_TO_MM4
 
-    # ---- warping constant [mm⁶] ----
     if hasattr(crosec, 'Cw'):
         props['Cw'] = crosec.Cw * M6_TO_MM6
 
-    # ---- radii of gyration [mm] ----
     for attr in ('iy', 'iz'):
         if hasattr(crosec, attr):
             props[attr] = getattr(crosec, attr) * M_TO_MM
 
-    # ---- elastic section moduli [mm³] ----
     for attr in ('Wely_z_pos', 'Wely_z_neg', 'Welz_y_pos', 'Welz_y_neg'):
         if hasattr(crosec, attr):
             props[attr] = getattr(crosec, attr) * M3_TO_MM3
 
-    # ---- plastic section moduli [mm³] ----
     for attr in ('Wply', 'Wplz', 'Wt'):
         if hasattr(crosec, attr):
             props[attr] = getattr(crosec, attr) * M3_TO_MM3
 
-    # ---- eccentricity ----
     if hasattr(crosec, 'ecce_loc'):
         props['ecce_loc'] = crosec.ecce_loc * M_TO_MM
 
-    # ---- material reference (raw object, not processed) ----
     props['material'] = crosec.material if hasattr(crosec, 'material') else None
     props['material_name'] = props['material'].name if (
         props['material'] and hasattr(props['material'], 'name')
     ) else ''
 
-    # ---- CroSec type ----
     props['section_type'] = type(crosec).__name__
 
     return props
 
-
 # ============================================================================
-#  Material properties  (single CroSec → dict, stress in MPa)
+#  Material properties  (model.materials → list of dicts, stress in MPa)
 # ============================================================================
 
-def extract_material(crosec):
-    """Read material properties from a CroSec's attached FemMaterial.
-
-    Args:
-        crosec: a CroSec object (with an attached .material).
-
-    Returns:
-        dict::
-
-            {
-                'name':   str,      # material name
-                'family': str,      # 'Steel', 'Concrete', …
-                'E':      float,    # Young's modulus              [MPa]
-                'G':      float,    # shear modulus                [MPa]
-                'fy':     float,    # yield strength               [MPa]
-                'fu':     float,    # ultimate tensile strength    [MPa]   (if available)
-                'nue':    float,    # Poisson's ratio              [-]
-                'gamma':  float,    # specific weight              [kN/m³]
-            }
-    """
-    mat = crosec.material if hasattr(crosec, 'material') else None
-    if mat is None:
-        return {}
-
+def extract_material(mat):
     props = {
         'name':   mat.name    if hasattr(mat, 'name')   else '',
         'family': mat.family  if hasattr(mat, 'family') else '',
@@ -352,11 +259,38 @@ def extract_material(crosec):
     try:
         props['E']     = mat.E(0)     * KN_M2_TO_MPA
         props['G']     = mat.G12()    * KN_M2_TO_MPA
-        props['fy']    = mat.fy(0)    * KN_M2_TO_MPA
-        props['fu']    = mat.fu(0)    * KN_M2_TO_MPA if hasattr(mat, 'fu') else 0.0
+        props['fc']    = mat.fc(0)    * KN_M2_TO_MPA
+        props['ft']    = mat.ft(0)    * KN_M2_TO_MPA
         props['nue']   = mat.nue12()
-        props['gamma'] = mat.gamma()   # kN/m³, native — no conversion
+        props['gamma'] = mat.gamma()    # kN/mm3
     except:
         pass
 
     return props
+
+def build_material_index_map(model):
+    """Build a lookup mapping section index → material index.
+
+    Matches each CroSec's material against model.materials by .NET object
+    identity (id()), so duplicate materials across sections correctly map to
+    the same material index.
+
+    Args:
+        model: Karamba model.
+
+    Returns:
+        list of int, same length as model.crosecs.  Each value is an index
+        into model.materials (extract_materials()), or -1 if unmatched.
+    """
+    if not hasattr(model, 'materials') or model.materials is None:
+        return [-1] * len(model.crosecs)
+
+    # Build id → material_index lookup
+    mat_id_to_idx = {id(mat): i for i, mat in enumerate(model.materials)}
+
+    mapping = []
+    for sec in model.crosecs:
+        mat = sec.material if hasattr(sec, 'material') else None
+        mapping.append(mat_id_to_idx.get(id(mat), -1) if mat is not None else -1)
+
+    return mapping

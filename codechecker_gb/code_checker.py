@@ -1,4 +1,5 @@
 import math
+import pandas as pd
 
 def calc_alpha(curve_class, lambda_n):
     """Return buckling curve coefficients [α₁, α₂, α₃] per GB50017 Table D.0.5.
@@ -48,15 +49,15 @@ def calc_phi(lambda_n, alpha):
 
 
 def classify_section(sec_props, fy):
-    """Classify a steel section per GB50017 Table 3.2 and Table D.0.1.
+    """Classify a steel section per GB50017 Table 3.5.1, Table 7.2.1 and Table 8.5.1.
 
     Determines:
-    - Buckling curve class (a/b/c/d) for strong and weak axes
+    - Buckling class (a/b/c/d) for strong and weak axes
     - Plastic adaptation factors γ_y, γ_z
     - Overall section class (1–5)
 
     Args:
-        sec_props: dict from karamba_helper.extract_section_properties()
+        sec_props: dict
         fy: yield strength [MPa]
 
     Returns:
@@ -74,7 +75,6 @@ def classify_section(sec_props, fy):
     tf = max(sec_props.get('uf_thick', 0), sec_props.get('lf_thick', 0))
     tw = sec_props.get('w_thick', 0)
     h  = sec_props.get('height', 0)
-    r  = sec_props.get('fillet_r', 0)
 
     if 'I' in sec_type or 'Beam' in sec_type:
         # Hot-rolled I-section: b' = (bf - tw - 2r) / 2
@@ -203,72 +203,44 @@ def classify_section(sec_props, fy):
     return curve_y, curve_z, gamma_y, gamma_z, overall_class
 
 
-def calc_slenderness(sec_props, len_y, len_z):
-    """Calculate slenderness ratios λ_y, λ_z for buckling checks.
+def calc_flexural_slenderness(len, i):
+    return len / i if i > 0 else 0.0
 
-    Closed sections (Box, CHS):  λ = L_cr / i   — simple flexural buckling
-    Open sections (I, T):        flexural-torsional buckling governs;
-                                 the weak-axis slenderness requires a
-                                 torsional component — **user to complete**.
 
-    Args:
-        sec_props: dict from extract_section_properties
-        len_y: effective buckling length, strong axis [mm]
-        len_z: effective buckling length, weak axis [mm]
+def calc_torsional_slenderness(len, i):
+    return calc_flexural_slenderness(len, i)  # placeholder
 
-    Returns:
-        (lambda_y, lambda_z)  — dimensionless slenderness ratios
-    """
-    sec_type = sec_props.get('section_type', '')
-    iy = sec_props.get('iy', 0)
-    iz = sec_props.get('iz', 0)
 
-    if 'Box' in sec_type or 'Circle' in sec_type:
-        # ============================================================
-        #  CLOSED SECTIONS  —  simple flexural buckling, both axes
-        # ============================================================
-        lambda_y = len_y / iy if iy > 0 else 0
-        lambda_z = len_z / iz if iz > 0 else 0
+def calc_slenderness(sec_props, len_y, len_z, len_lt):
+    sec_type = sec_props['section_type']
+    iy = sec_props['iy']
 
-    elif 'I' in sec_type or 'Beam' in sec_type or 'T' in sec_type:
-        # ============================================================
-        #  OPEN SECTIONS  —  flexural-torsional buckling
-        #
-        #  Strong axis (y):  flexural buckling,  λ_y = L_cr_y / i_y
-        #
-        #  Weak axis (z):    flexural-torsional buckling may govern.
-        #    The equivalent slenderness λ_z_eq needs to account for
-        #    torsional rigidity (I_pp), warping (C_w), and the
-        #    shear-centre offset.  See GB50017 §7.2.3.
-        #
-        #    λ_z_eq = λ_z × <correction factor based on section>
-        #
-        #  TODO: user to implement the correct λ_z for open sections.
-        #    Leave λ_z as simple flexural for now (to be replaced).
-        # ============================================================
-        lambda_y = len_y / iy if iy > 0 else 0
-        lambda_z = len_z / iz if iz > 0 else 0    # ← REPLACE with λ_z_eq
+    # Strong-axis: always simple flexural buckling
+    lambda_y = calc_flexural_slenderness(len_y, iy)
 
+    # Weak-axis: flexural-torsional buckling for open sections
+    if 'I' in sec_type or 'Beam' in sec_type or 'T' in sec_type:
+        lambda_z = calc_torsional_slenderness(sec_props, len_z)
     else:
-        # Unknown — fallback to simple flexural buckling
-        lambda_y = len_y / iy if iy > 0 else 0
-        lambda_z = len_z / iz if iz > 0 else 0
+        lambda_z = calc_flexural_slenderness(len_z, sec_props['iz'])
 
-    return lambda_y, lambda_z
+    # Lateral-torsional buckling (LTB)
+    lambda_lt = calc_flexural_slenderness(len_lt, sec_props['iz'])
+
+    return lambda_y, lambda_z, lambda_lt
 
 
-def check_steel_element(sec_props, mat_props, len_y, len_z, force,
-                        gamma_re=0.85, slender_limit=150):
+def check_steel_element(sec_props, mat, eff_len, force,
+                        gamma_re = 1.0, slender_limit=150):
     """Run all GB50017-2017 steel checks for one force state on one element.
 
     Args:
         sec_props:  dict from karamba_helper.extract_section_properties()
         mat_props:  dict from karamba_helper.extract_material()
-        len_y:      effective buckling length, strong axis  [mm]
-        len_z:      effective buckling length, weak axis    [mm]
+        eff_len:    effective buckling length 
+                    dict {'bklY':mm, 'bklZ':mm, 'bklLT':mm}
         force:      dict {'N':kN, 'Vy':kN, 'Vz':kN, 'Mx':kN·m, 'My':kN·m, 'Mz':kN·m}
-                    single position from extract_element_forces() output
-        gamma_re:   resistance factor (default 0.85)
+        gamma_re:   seismic resistance factor (default 1.0)
         slender_limit: slenderness limit (default 150 per GB50017)
 
     Returns:
@@ -291,41 +263,26 @@ def check_steel_element(sec_props, mat_props, len_y, len_z, force,
              'warning':          ''}    # non-empty if slenderness > limit
     """
     # ---- unpack material ----
-    E  = mat_props.get('E',  206000.0)   # MPa, fallback Q235
-    fy = mat_props.get('fy', 235.0)
-    fv = 0.58 * fy                        # shear strength, GB50017 §6.1.3
-    f  = fy                               # design strength (simplified)
+    E, fy, f, fv = (mat['E'], mat['fy'], mat['f'], mat['fv'])
 
     # ---- unpack section properties ----
-    A   = sec_props.get('A', 0)
-    Iyy = sec_props.get('Iyy', 0)
-    Izz = sec_props.get('Izz', 0)
-    sec_type = sec_props.get('section_type', '')
+    sec_type = sec_props['section_type']
+    A, Iyy, Izz = (sec_props['A'], sec_props['Iyy'], sec_props['Izz'])
+    Sy, Sz, ty, tz = (sec_props['Ay'], sec_props['Az'], sec_props['lf_thick'], sec_props['w_thick'])
+    # TODO: check Wely_z_pos, Wely_z_neg, Welz_y_pos, Welz_y_neg for asymmetric section
+    Wy = max(sec_props['Wely_z_pos'], sec_props['Wely_z_neg'])
+    Wz = max(sec_props['Welz_y_pos'], sec_props['Welz_y_neg'])
 
     # ---- classify section & compute shear geometry ----
-    curve_y, curve_z, gamma_y, gamma_z, overall_class = classify_section(sec_props, fy)
-    Sy, Sz, ty, tz = compute_S_and_t(sec_props)
-
-    # ---- select section moduli ----
-    if overall_class <= 2:
-        # Plastic design → use Wpl
-        Wy = sec_props.get('Wply', sec_props.get('Wely_z_pos', 0))
-        Wz = sec_props.get('Wplz', sec_props.get('Welz_y_pos', 0))
-    else:
-        # Elastic design → use Wel
-        Wy = max(sec_props.get('Wely_z_pos', 0), sec_props.get('Wely_z_neg', 0))
-        Wz = max(sec_props.get('Welz_y_pos', 0), sec_props.get('Welz_y_neg', 0))
+    curve_y, curve_z, gamma_y, gamma_z, overall_class = classify_section(sec_props, fy)    
 
     # ---- unpack & convert forces: kN → N,  kN·m → N·mm ----
-    Fx = force['N']  * 1e3
-    Vy = force['Vy'] * 1e3
-    Vz = force['Vz'] * 1e3
-    # Mx = force['Mx'] * 1e6   # torsion — not used in current checks
-    My = force['My'] * 1e6
-    Mz = force['Mz'] * 1e6
+    Fx, Vy, Vz = (force['N'] * 1e3, force['Vy'] * 1e3, force['Vz'] * 1e3)
+    Mx, My, Mz = (force['Mx'] * 1e6, force['My'] * 1e6, force['Mz'] * 1e6)
 
     # ---- slenderness ----
-    lambda_y, lambda_z = calc_slenderness(sec_props, len_y, len_z)
+    len_y, len_z, len_lt = (eff_len['bklY'], eff_len['bklZ'], eff_len['bklLT'])
+    lambda_y, lambda_z, lambda_lt = calc_slenderness(sec_props, len_y, len_z, len_lt)
     warning = ''
     if lambda_y > slender_limit:
         warning = f'λ_y={lambda_y:.0f} > {slender_limit}'
@@ -334,10 +291,7 @@ def check_steel_element(sec_props, mat_props, len_y, len_z, force,
             warning += '; '
         warning += f'λ_z={lambda_z:.0f} > {slender_limit}'
 
-    # ========================================================================
-    #  Strength checks
-    # ========================================================================
-
+    #  STRENGTH
     # ---- N  §7.1.1  axial stress ----
     sigma_N = abs(Fx) / A if A > 0 else 0
 
@@ -360,10 +314,7 @@ def check_steel_element(sec_props, mat_props, len_y, len_z, force,
     # ---- N + My + Mz  §8.2.1  combined axial + bending ----
     sigma_NM = sigma_N + sigma_Myz
 
-    # ========================================================================
-    #  Stability checks
-    # ========================================================================
-
+    #  STABILITY
     # Normalised slenderness
     lambda_n_y = (lambda_y / math.pi) * math.sqrt(fy / E) if E > 0 else 0
     lambda_n_z = (lambda_z / math.pi) * math.sqrt(fy / E) if E > 0 else 0
@@ -398,26 +349,18 @@ def check_steel_element(sec_props, mat_props, len_y, len_z, force,
     term_z3 = eta * beta * abs(My) / (phi_b * Wy) if Wy > 0 else 0
     sigma_NMz_buckling = term_z1 + term_z2 + term_z3
 
-    # ========================================================================
-    #  Utilization ratios  (stress / design strength × γ_RE)
-    # ========================================================================
-
-    utilization = {
-        'σ_N':              sigma_N / f * gamma_re,
-        'σ_My':             sigma_My / f * gamma_re,
-        'σ_Mz':             sigma_Mz / f * gamma_re,
-        'σ_Myz':            sigma_Myz / f * gamma_re,
-        'τ_Vy':             tau_Vy / fv * gamma_re,
-        'τ_Vz':             tau_Vz / fv * gamma_re,
-        'σ_NMyz':           sigma_NM / f * gamma_re,
-        'σ_Ny_buckling':    sigma_Ny_buckling / f * gamma_re,
-        'σ_Nz_buckling':    sigma_Nz_buckling / f * gamma_re,
-        'σ_NMyz_buckling':  sigma_NMy_buckling / f * gamma_re,
-        'σ_NMzy_buckling':  sigma_NMz_buckling / f * gamma_re,
-        'λ_y':              lambda_y,
-        'λ_z':              lambda_z,
-        'class_overall':    overall_class,
-        'warning':          warning,
-    }
+    #  UTILIZATION (stress / design strength / γ_RE)
+    utilization = pd.Series({
+        'σ_N':              sigma_N / f,
+        'σ_My':             sigma_My / f,
+        'σ_Mz':             sigma_Mz / f,
+        'σ_Myz':            sigma_Myz / f,
+        'τ_Vy':             tau_Vy / fv,
+        'τ_Vz':             tau_Vz / fv,
+        'σ_NMyz':           sigma_NM / f,
+        'σ_Ny_buckling':    sigma_Ny_buckling / f,
+        'σ_Nz_buckling':    sigma_Nz_buckling / f,
+        'σ_NMyz_buckling':  sigma_NMy_buckling / f,
+        'σ_NMzy_buckling':  sigma_NMz_buckling / f})/gamma_re
 
     return utilization

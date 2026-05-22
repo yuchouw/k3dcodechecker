@@ -20,10 +20,6 @@ import warnings
 from Karamba.Elements import BuilderElementStraightLine
 
 
-# ============================================================================
-#  Load combination expansion
-# ============================================================================
-
 def expand_load_combinations(model, comb_names):
     sub_lcs = []
     for cn in comb_names:
@@ -37,10 +33,6 @@ def expand_load_combinations(model, comb_names):
             sub_lcs.append((sub_lc.Name, facs))
     return sub_lcs
 
-
-# ============================================================================
-#  Element info extraction
-# ============================================================================
 
 def extract_element_length(el):
     bklY = el.buckling_length(BuilderElementStraightLine.BucklingDir.bklY) * M_TO_MM
@@ -63,10 +55,8 @@ def extract_element_length(el):
     }
 
 
-# ============================================================================
-#  Section properties  (units = mm / mm² / mm⁴ / mm³)
-# ============================================================================
 def extract_section_properties(crosec):
+    #  Section properties  (units = mm / mm² / mm⁴ / mm³)
     props = {}
 
     props['fe_ind'] = crosec.fe_ind(0)
@@ -114,9 +104,6 @@ def extract_section_properties(crosec):
         if hasattr(crosec, attr):
             props[attr] = getattr(crosec, attr) * M3_TO_MM3
 
-    if hasattr(crosec, 'ecce_loc'):
-        props['ecce_loc'] = crosec.ecce_loc * M_TO_MM
-
     return props
 
 def extract_material(mat):
@@ -125,10 +112,11 @@ def extract_material(mat):
         'family': mat.family  if hasattr(mat, 'family') else '',
     }
     try:
-        props['E']     = mat.E(0)     * KN_M2_TO_MPA
-        props['fc']    = mat.fc(0)    * KN_M2_TO_MPA
-        props['ft']    = mat.ft(0)    * KN_M2_TO_MPA
-        props['gamma'] = mat.gamma()    # kN/mm3
+        props['E']      = mat.E(0)     * KN_M2_TO_MPA
+        props['fy']     = mat.ft(0)    * KN_M2_TO_MPA
+        props['f']      = 300           # TODO
+        props['fv']     = 170           # TODO
+        props['gamma']  = mat.gamma()   # kN/m3
     except:
         pass
 
